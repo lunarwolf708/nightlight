@@ -1,0 +1,191 @@
+import machine
+import math
+import neopixel
+import network
+import random
+import secrets
+import time
+import mqtt
+
+MAX_U16 = (1 << 16) - 1  # Maximum 16-bit unsigned value
+MAX_U8 = (1 << 8) - 1    # Maximum 8-bit unsigned value
+
+class Command:
+    """
+    Represents MQTT commands for start, stop, and other.
+    """
+    START = 'start'
+    STOP = 'stop'
+    OTHER = 'other'
+
+class NetworkManager:
+    """
+    Manages Wi-Fi and MQTT connection for controlling the nightlight.
+    """
+    def __init__(self):
+        self.wlan = network.WLAN(network.STA_IF)
+        self.mqtt_broker = 'broker.hivemq.com'
+        self.client = mqtt.MQTTClient('ME35_not_chris', self.mqtt_broker, 1883, keepalive=60)
+        self.curr_callback = Command.OTHER
+
+    def connect_to_internet(self):
+        """
+        Connect to Wi-Fi using credentials.
+        """
+        self.wlan.active(True)
+        if not self.wlan.isconnected():
+            self.wlan.connect(secrets.mysecrets['SSID'], secrets.mysecrets['key'])
+            while not self.wlan.isconnected():
+                time.sleep(1)
+        print(f'Connected to network with IP {self.wlan.ifconfig()[0]}')
+
+    def callback(self, topic, msg):
+        """
+        Handles MQTT messages for start/stop commands.
+        """
+        msg = msg.decode()
+        if msg == 'start':
+            self.curr_callback = Command.START
+        elif msg == 'stop':
+            self.curr_callback = Command.STOP
+        else:
+            self.curr_callback = Command.OTHER
+
+    def connect_to_MQTT(self):
+        """
+        Connect to MQTT and subscribe to the topic.
+        """
+        self.client.connect()
+        self.client.set_callback(self.callback)
+        self.client.subscribe('ME35-24/nightlight')
+
+    def check_callback(self):
+        """
+        Check for incoming MQTT messages and process them.
+        """
+        self.client.check_msg()
+        return self.curr_callback
+
+class BuzzerManager:
+    """
+    Manages buzzer sound using PWM.
+    """
+    def __init__(self):
+        self.buzzer = machine.PWM(machine.Pin(18))
+        self.buzzer.freq(440)
+        self.is_buzzing = False
+        self.buzz_duration = 0.5 * 10**9  # 0.5 seconds in nanoseconds
+
+    def start_buzzing(self):
+        self.is_buzzing = True
+        self.buzzer.duty_u16(1000)
+        self.start_time = time.time_ns()
+
+    def check_buzzing(self):
+        if self.is_buzzing and time.time_ns() - self.start_time > self.buzz_duration:
+            self.stop_buzzing()
+
+    def stop_buzzing(self):
+        self.is_buzzing = False
+        self.buzzer.duty_u16(0)
+
+class NeoPixelManager:
+    """
+    Manages NeoPixel LED colors.
+    """
+    def __init__(self):
+        self.led = neopixel.NeoPixel(machine.Pin(28), 1)
+        self.off_color = (0, 0, 0)
+        self.color = self.off_color
+        self.set_color()
+
+    def random_color(self):
+        self.color = (random.randint(0, MAX_U8), random.randint(0, MAX_U8), random.randint(0, MAX_U8))
+        self.set_color()
+
+    def set_color(self):
+        self.led[0] = self.color
+        self.led.write()
+
+    def off(self):
+        self.led[0] = self.off_color
+        self.led.write()
+
+class ButtonManager:
+    """
+    Detects button presses.
+    """
+    def __init__(self):
+        self.button = machine.Pin(20, machine.Pin.IN, machine.Pin.PULL_UP)
+        self.prev_state = self.button.value()
+
+    def is_pressed(self):
+        current_state = self.button.value()
+        if current_state == 0 and self.prev_state == 1:
+            self.prev_state = current_state
+            return True
+        self.prev_state = current_state
+        return False
+
+class LEDManager:
+    """
+    Manages breathing LED effect using PWM.
+    """
+    def __init__(self):
+        self.led = machine.PWM(machine.Pin(0))
+        self.led.freq(50)
+
+    def update_brightness(self, timestamp):
+        brightness = (-math.cos((2 * math.pi / 2) * (timestamp / 10**9)) + 1) / 2
+        self.led.duty_u16(int(MAX_U16 * brightness))
+
+    def off(self):
+        self.led.duty_u16(0)
+
+class MainManager:
+    """
+    Coordinates all components and manages the main loop.
+    """
+    def __init__(self):
+        self.running = True
+        self.start_time = time.time_ns()
+        self.network = NetworkManager()
+        self.led_manager = LEDManager()
+        self.neopixel_manager = NeoPixelManager()
+        self.button_manager = ButtonManager()
+        self.buzzer_manager = BuzzerManager()
+
+        self.network.connect_to_internet()
+        self.network.connect_to_MQTT()
+
+    def run(self):
+        while True:
+            command = self.network.check_callback()
+            if command == Command.STOP:
+                self.stop()
+            elif command == Command.START:
+                self.start()
+
+            if self.running:
+                timestamp = time.time_ns() - self.start_time
+                self.led_manager.update_brightness(timestamp)
+                self.buzzer_manager.check_buzzing()
+
+                if self.button_manager.is_pressed():
+                    self.neopixel_manager.random_color()
+                    self.buzzer_manager.start_buzzing()
+
+            time.sleep(0.01)
+
+    def stop(self):
+        self.running = False
+        self.led_manager.off()
+        self.neopixel_manager.off()
+        self.buzzer_manager.stop_buzzing()
+
+    def start(self):
+        self.running = True
+        self.neopixel_manager.set_color()
+
+manager = MainManager()
+manager.run()
