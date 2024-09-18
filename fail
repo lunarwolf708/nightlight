@@ -1,0 +1,373 @@
+#Accel.py:
+
+import machine
+
+import math
+
+import asyncio
+
+ 
+
+class Acceleration():
+
+    TAP_THRESHOLD = 10.0  # Define your threshold value for a tap
+
+ 
+
+    def __init__(self, sda_pin, scl_pin, mqtt_client, indicator_pin, addr = 0x62):
+
+        self.addr = addr
+
+        self.i2c = machine.I2C(1, scl=machine.Pin(scl_pin), sda=machine.Pin(sda_pin))
+
+        self.client = mqtt_client
+
+        self.isTap = False
+
+        self.connected = False
+
+       
+
+        if self.is_connected():
+
+            print('connected')
+
+            asyncio.create_task(self.write_byte(0x11,0)) #start data stream
+
+ 
+
+    def is_connected(self):
+
+        options = self.i2c.scan()
+
+        print(options)
+
+        self.connected = self.addr in options
+
+        return self.connected
+
+ 
+
+    async def read_accel(self):
+
+        buffer = self.i2c.readfrom_mem(self.addr, 0x02, 6) # read 6 bytes starting at memory address 2
+
+        await asyncio.sleep_ms(10)
+
+        return struct.unpack('<hhh',buffer)
+
+ 
+
+    async def write_byte(self, cmd, value):
+
+        self.i2c.writeto_mem(self.addr, cmd, value.to_bytes(1,'little'))
+
+ 
+
+    async def read_event(self):
+
+        print('-------ACCEL.READ_EVENT CALLED-----')
+
+        while True:
+
+            try:
+
+                data = await self.read_accel()
+
+                mag = math.sqrt(data[0]**2 + data[1]**2 + data[2]**2)
+
+                await asyncio.sleep(0.01)
+
+           
+
+                if mag > self.TAP_THRESHOLD:
+
+                    print(f"Tap detected with magnitude: {mag}")
+
+                    self.isTap = True
+
+                    self.indicator.on()  # Turn on an indicator if necessary
+
+                    await asyncio.sleep(0.05)
+
+                    self.indicator.off()
+
+                    self.client.publish("ME35-24/Apurva", "tapped")
+
+            except Exception as e:
+
+                print(f"Error in read_event: {e}")
+
+            await asyncio.sleep(0.1)
+
+ 
+
+# main2.py
+
+import time
+
+import machine
+
+import asyncio
+
+from mqtt import MQTTClient
+
+from button import Button
+
+from accel import Acceleration
+
+ 
+
+# Setup WiFi connection
+
+import network
+
+ 
+
+wlan = network.WLAN(network.STA_IF)
+
+wlan.active(True)
+
+wlan.connect('Tufts_Robot', '')
+
+ 
+
+while wlan.ifconfig()[0] == '0.0.0.0':
+
+    print('.', end=' ')
+
+    time.sleep(1)
+
+ 
+
+print(wlan.ifconfig())
+
+ 
+
+# MQTT setup
+
+mqtt_broker = 'broker.hivemq.com'
+
+port = 1883
+
+topic_sub = 'ME35-24/Apurva'  # Updated topic
+
+topic_pub = 'ME35-24/Apurva'
+
+ 
+
+# MQTT callback function
+
+def mqtt_callback(topic, msg):
+
+    global system_on
+
+    print(f"Message received: {topic.decode()}, {msg.decode()}")
+
+ 
+
+    if msg.decode() == 'on':
+
+        print("Turning system ON")
+
+        system_on = True
+
+    elif msg.decode() == 'off':
+
+        print("Turning system OFF")
+
+        system_on = False
+
+ 
+
+# Attach the callback function to the client
+
+ 
+
+ 
+
+client = MQTTClient('ME35_chris', mqtt_broker, port, keepalive=60)
+
+client.connect()
+
+client.set_callback(mqtt_callback)
+
+client.subscribe(topic_sub.encode())
+
+print('Connected to MQTT broker')
+
+ 
+
+# Initialize Button and Accelerometer
+
+button = Button(pin=20, neopixel_pin=28, buzzer_pin=18)
+
+accelerometer = Acceleration(sda_pin=26, scl_pin=27, mqtt_client=client, indicator_pin=15)
+
+ 
+
+# Global variable to turn the system on/off
+
+system_on = False
+
+ 
+
+# External LED dimming (breathe) function
+
+async def breathe_led():
+
+    led_pwm = machine.PWM(machine.Pin(13))  # Pin 13 for the external LED
+
+    led_pwm.freq(1000)
+
+    while system_on:
+
+        for duty in range(0, 65535, 500):
+
+            led_pwm.duty_u16(duty)
+
+            await asyncio.sleep_ms(10)
+
+        for duty in range(65535, 0, -500):
+
+            led_pwm.duty_u16(duty)
+
+            await asyncio.sleep_ms(10)
+
+ 
+
+# Button checking task
+
+async def check_button():
+
+    while system_on:
+
+        await button.check_and_update()
+
+        await asyncio.sleep_ms(50)
+
+ 
+
+# Accelerometer task to check for taps
+
+async def check_accelerometer():
+
+    while system_on:
+
+        await accelerometer.read_event()
+
+ 
+
+# MQTT task to continually check messages
+
+async def mqtt_check():
+
+    global system_on
+
+    while True:
+
+        client.check_msg()
+
+        await asyncio.sleep(0.1)
+
+ 
+
+ 
+
+ 
+
+# Main loop
+
+async def main():
+
+    while True:
+
+        if system_on:
+
+            # Start tasks when system is on
+
+            asyncio.create_task(breathe_led())
+
+            asyncio.create_task(check_button())
+
+            asyncio.create_task(check_accelerometer())
+
+        await asyncio.sleep(1)
+
+ 
+
+# Get the event loop and schedule tasks
+
+loop = asyncio.get_event_loop()
+
+ 
+
+# Schedule mqtt_check task
+
+loop.create_task(mqtt_check())
+
+ 
+
+# Start the loop and run forever
+
+try:
+
+    loop.run_forever()
+
+except KeyboardInterrupt:
+
+    print("Stopped by user")
+
+finally:
+
+    loop.close()
+
+ 
+
+#button.py:
+
+import machine
+
+import neopixel
+
+import asyncio
+
+ 
+
+class Button:
+
+    def __init__(self, pin, neopixel_pin, buzzer_pin):
+
+        self.button = machine.Pin(pin, machine.Pin.IN)
+
+        self.led = neopixel.NeoPixel(machine.Pin(neopixel_pin), 1)
+
+        self.buzzer = machine.PWM(machine.Pin(buzzer_pin, machine.Pin.OUT))
+
+        self.buzzer.freq(440)
+
+        self.on_color = (40, 0, 0)  # RGB color for "on"
+
+        self.off_color = (0, 0, 0)  # RGB color for "off"
+
+   
+
+    async def check_and_update(self):
+
+        if not self.button.value():
+
+            self.led[0] = self.on_color
+
+            self.led.write()
+
+            self.buzzer.duty_u16(1000)  # Activate buzzer
+
+            await asyncio.sleep(0.1)  # Duration of the buzz
+
+            self.buzzer.duty_u16(0)    # Deactivate buzzer
+
+        else:
+
+            self.led[0] = self.off_color
+
+            self.led.write()
